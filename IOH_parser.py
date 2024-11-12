@@ -24,8 +24,12 @@ class IOH_Parser:
             # Raise this error in case the file is not found
             raise(e.args)
         
-        except Exception as e:
+        except json.JSONDecodeError as e:
+
             raise(e.args)
+        
+        #except Exception as e:
+        #    raise(e.args)
         
         # Get the current directory
         curdir = os.path.dirname(filepath)
@@ -138,6 +142,7 @@ class Opt_Scenario:
     def __init__(self,scenarios_dict:dict, directory:str) -> None:
         self.__dimensions:int = scenarios_dict['dimension']
         self.__path:str = os.path.join(directory, scenarios_dict['path'])
+        self.__runs:list = [Runs(scenarios_dict['runs'][idx]) for idx,a in enumerate(scenarios_dict["runs"])]
         self.__num_runs:int = len(scenarios_dict['runs'])
         self.__data:pd.DataFrame = self.__load_dat_file_with_iterations()
         
@@ -206,6 +211,21 @@ class Opt_Scenario:
 
         return df
     
-
-
+class Runs:
+    def __init__(self,runs_dict:dict) -> None:
+        # Normal parameters
+        self.__instance:int = runs_dict['instance']
+        self.__tot_evals:int = runs_dict['evals']
+        
+        #Obtain the dictionary with the results
+        self.__best:dict = runs_dict['best']
+        
     
+    
+    @property
+    def instance(self)->int:
+        return self.__instance
+    
+    @property
+    def evals(self)->int:
+        return self.__tot_evals
