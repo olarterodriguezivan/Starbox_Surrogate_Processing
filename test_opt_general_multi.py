@@ -8,8 +8,12 @@ import shutil
 import time
 from typing import List, Callable, Iterable
 
-# Import PYCMA-ES
+# Import PYCMA-ES (from Nikolaus Hansen)
 import cma
+
+# Import the Modular CMA-ES library (Jacob de Nobel, Diederick Vermetten)
+from modcma import c_maes
+from modcma import AskTellCMAES
 
 # IOH
 import ioh
@@ -36,11 +40,25 @@ from skops.io import dump, load
 LAMDA:float = 3.981071705534969283e+02
 INTRUSION_PRIME:float = 60.00
 
-BUDGET:int = 1000 # Manage a budget of 
+BUDGET:int = 1000 # Manage a budget of simulations
 DIMENSIONS:list = [1,3,5]
-SIGMA_0:float = (0.25/1)*10
+SIGMA_0:float = 2.5/2
 N_RUNS:int =  50 # Number of runs
-MAX_RESTARTS_DEFAULT:int = 5
+MAX_RESTARTS_DEFAULT:int = 10
+
+# THIS IS A SWITCH TO CHANGE BETWEEN JUST ANALYZING EVERYTHING IN 5-D
+# OR PERHAPS USING SUBDIMENSIONAL SURROGATES
+DIMENSIONALITY_CASE:int = 1
+
+
+# LIBRARY TO USE
+# If set to '1' then use Niko Hansen's Library
+# If '2', then use Modular CMA-ES library (Jacob de Nobel, Diederick Vermetten)
+CMA_ES_HAND:int = 2
+
+# Change this to define the case to evaluate the population size
+POP_CASE = 2
+
 
 ##### -----------------------------------------------------------
 ##### ------------------HELPER FUNCTIONS-------------------------
@@ -69,24 +87,28 @@ class Starbox_problem(ioh.problem.RealSingleObjective):
     def evaluate(self, X:np.ndarray):
         
         # Reshape the array to be read by the regressor models
+
         X_ = X.reshape((1,-1))
         self.__cur_intrusion:float = self.__regressor_model_intrusion.predict(X=X_)[0]
         self.__cur_sea:float = self.__regressor_model_sea.predict(X=X_)[0]
 
         funct_eval:float = self.__cur_sea - self.__lamda*np.abs(self.__cur_intrusion-INTRUSION_PRIME)
+        #funct_eval:float = self.__cur_sea - self.__lamda*np.maximum(self.__cur_intrusion-INTRUSION_PRIME,0)
 
-        if self.meta_data.optimization_type.MAX:
+        if self.meta_data.optimization_type.name == "MAX":
             return funct_eval
         else:
             return -1* funct_eval
-
     
+
+            
+
     @property
     def regressor_model_sea(self)->GridSearchCV:
         return self.__regressor_model_sea
     
     @regressor_model_sea.deleter
-    def regressor_model(self):
+    def regressor_model_sea(self):
         del self.__regressor_model_sea
 
     @property
@@ -120,8 +142,6 @@ class Starbox_problem(ioh.problem.RealSingleObjective):
     @lamda.setter
     def lamda(self,new_lamda:float)->None:
         self.__lamda = new_lamda
-    
-
     
 
 class Input_Manager:
@@ -242,6 +262,115 @@ class Input_Manager:
     def cur_sea(self)->float:
         return self.__cur_sea
 
+
+def modify_array(x_0:np.ndarray):
+    # This is the decorator factory function
+    def decorator(func):
+        def wrapper(x_inp:np.ndarray):
+            # Apply modifications based on `modification_type`
+            arr = np.array(x_inp).ravel()
+            x_01 = np.array(x_0).ravel()
+            if x_inp.size == 1:
+                modified_array = np.array([x_01[0],x_01[1],x_01[2],x_01[3],arr[0]])
+            elif x_inp.size == 3:
+                modified_array = np.array([arr[0],arr[1],x_01[2],x_01[3],arr[2]])
+            else:
+                modified_array = np.array(x_inp).ravel()  # No modification if type is unknown
+
+            # Call the original function with the modified array
+            return func(modified_array)
+        return wrapper
+    return decorator
+
+
+def return_simulation_setup(initial_val:np.ndarray,changing_dimensions:int=1,
+                            initial_budget:int=BUDGET,full_sampler:bool=True)->cma.CMAOptions:
+    
+    if not initial_val.size  == 5:
+        raise ValueError("The initial value should be of size 5")
+
+    # Fill the fixed variables property
+    if changing_dimensions == 1:
+        fixed_vars = {
+            0:initial_val[0,0],
+            1:initial_val[0,1],
+            2:initial_val[0,2],
+            3:initial_val[0,3],
+        }
+    elif changing_dimensions ==3:
+        fixed_vars = {
+            2:initial_val[0,2],
+            3:initial_val[0,3],
+        }
+    else:
+        fixed_vars = {}
+
+    # Initialize the CMA-ES Object
+    # Options
+
+    if full_sampler:
+        samp:cma.sampler = cma.sampler.GaussFullSampler
+    else:
+        samp:cma.sampler = cma.sampler.GaussStandardConstant
+
+    opts:cma.CMAOptions = cma.CMAOptions()
+    opts.set({'bounds':[-5.0,5.0],
+            'tolfun': 1e-12,
+            'maxfevals':initial_budget,
+            'CMA_sampler':samp,
+            'fixed_variables':fixed_vars,
+    })
+
+    # Return the options of the CMA-ES algorithm
+
+    return opts
+
+def adjust_initial_input(x0:np.ndarray,dim:int):
+
+    x_01:np.ndarray = x0.ravel()
+
+    if not x0.size==5:
+        raise ValueError("The size of the array must be 5")
+    if dim ==1:
+        return np.array([x_01[-1]]).ravel()
+    elif dim ==3:
+        return np.array([x_01[0], x_01[1],x_01[-1]]).ravel()
+    elif dim ==5:
+        return x_01
+    else:
+        raise ValueError("Dimension is badly set")
+
+
+def return_initial_mu_lamda(dim:int, case:int)->List[int]:
+
+    if dim not in (1,3,5):
+        raise ValueError("The dimension should be an integer equal to 1,3 or 5")
+    
+    # Some lambda functions to compute the parent and offspring sizes
+    default_lamda = lambda d: int(np.floor(4+3*np.log(d)))
+    default_mu = lambda lamdda: int(np.ceil(lamdda/2))
+
+    # Now evaluate the cases
+    if case == 0:
+        # The computation is let free depending on the dimension
+        lamda = default_lamda(dim)
+        return lamda,default_mu(lamda)
+    
+    elif case == 1:
+        lamda = default_lamda(1)
+
+    elif case == 2:
+        lamda = default_lamda(3)
+
+    elif case == 3:
+        lamda = default_lamda(5)
+    
+
+    return default_mu(lamda), lamda
+
+
+
+
 # Generate two properties from the IOH framework to account for 
 # intrusion and specific energy absorption metrics
 
@@ -251,7 +380,7 @@ class Input_Manager:
 ##### -----------------------------------------------------------
 
 # Change the working directory
-os.chdir('/home/ivanolar/Documentos')
+os.chdir('/home/ivanolar/Documents')
 
 # Load the model saved
 # The trusted parameter can be adjusted;
@@ -274,10 +403,14 @@ logger_ioh_cont_2:List[ioh.logger.Analyzer] = []
 
 for idx,dim in enumerate(DIMENSIONS):
 
+    if CMA_ES_HAND ==1:
+        extra_str = "Hansen"
+    elif CMA_ES_HAND ==2:
+        extra_str = "Vermetten-De_Nobel"
     logger_ioh = ioh.logger.Analyzer(
         root=os.getcwd(),                  # Store data in the current working directory
         folder_name=f"Star_Box_CMA_ES_{dim}D_dual",       # in a folder named: 'my-experiment'
-        algorithm_name="CMA-ES",    # meta-data for the algorithm used to generate these results
+        algorithm_name=f"CMA-ES_{extra_str}",    # meta-data for the algorithm used to generate these results
         store_positions=True,               # store x-variables in the logged files
         triggers= triggers,
     )
@@ -286,7 +419,7 @@ for idx,dim in enumerate(DIMENSIONS):
     logger_ioh_2 = ioh.logger.Analyzer(
         root=os.getcwd(),                  # Store data in the current working directory
         folder_name=f"Star_Box_CMA_ES_{dim}D_iso_dual",       # in a folder named: 'my-experiment'
-        algorithm_name="CMA-ES_iso",    # meta-data for the algorithm used to generate these results
+        algorithm_name=f"CMA-ES_iso_{extra_str}",    # meta-data for the algorithm used to generate these results
         store_positions=True,               # store x-variables in the logged files
         triggers= triggers,
     )
@@ -299,8 +432,8 @@ for idx,dim in enumerate(DIMENSIONS):
 del logger_ioh, logger_ioh_2
 
 # Logger
-logger:cma.CMADataLogger= cma.CMADataLogger()
-logger_2:cma.CMADataLogger= cma.CMADataLogger()
+#logger:cma.CMADataLogger= cma.CMADataLogger()
+#logger_2:cma.CMADataLogger= cma.CMADataLogger()
 
 
 bestever = cma.optimization_tools.BestSolution()
@@ -312,128 +445,188 @@ ff2:ioh.problem.RealSingleObjective = Starbox_problem(model_intrusion,model_sea,
 for run in range(N_RUNS):
 
     x0 = np.random.uniform(-5,5,(1,5))
+
+    
     
     for idx, dim in enumerate(DIMENSIONS):
-        
-        x0_1 = x0.reshape((1,-1))
-        if dim == 1:
-     
-            fixed_vars = {
-                0:x0[0,0],
-                1:x0[0,1],
-                2:x0[0,2],
-                3:x0[0,3],
-            }
-        elif dim ==3:
-            fixed_vars = {
-                2:x0[0,2],
-                3:x0[0,3],
-            }
-        else:
-            
-            fixed_vars = {}
-        
-        # Start CMA ES
-        # Options
-        opts:cma.CMAOptions = cma.CMAOptions()
-        opts.set({'bounds':[-5.0,5.0],
-                'tolfun': 1e-12,
-                'maxfevals':BUDGET,
-                'CMA_sampler':cma.sampler.GaussFullSampler,
-                'fixed_variables':fixed_vars
-        })
-                #'verb_append':bestever.evalsall})
 
-        opts2:cma.CMAOptions = cma.CMAOptions()
-        opts2.set({'bounds':[-5.0,5.0],
-                'tolfun': 1e-12,
-                'maxfevals':BUDGET,
-                'CMA_sampler':cma.sampler.GaussStandardConstant,
-                'fixed_variables':fixed_vars,
-        })
-
+        mu_0, lamda_0 = return_initial_mu_lamda(dim=dim,case=POP_CASE)
+        
+        # Update the dimensionality track for IOH
         ff.opt_dimensionality = dim
         ff2.opt_dimensionality = dim
 
+        ff.lamda = LAMDA
+        ff2.lamda = LAMDA
+
+
+        # Set the tracks for the logger (Namely intrusion and sea)
         logger_ioh_cont_1[idx].watch(ff,['cur_intrusion','cur_sea'])
         logger_ioh_cont_1[idx].add_run_attributes(ff,['opt_dimensionality','lamda'])
 
 
         logger_ioh_cont_2[idx].watch(ff2,['cur_intrusion','cur_sea'])
         logger_ioh_cont_2[idx].add_run_attributes(ff2,['opt_dimensionality','lamda'])
-        
 
         ff.attach_logger(logger_ioh_cont_1[idx])
         ff2.attach_logger(logger_ioh_cont_2[idx])
 
-        # Run the default initial value
-        ff(x0_1)
-        ff2(x0_1)
+
+        if CMA_ES_HAND == 1:
+
+
+            opts = return_simulation_setup(x0,dim,initial_budget=BUDGET,full_sampler=True)
+            opts2 = return_simulation_setup(x0,dim,initial_budget=BUDGET,full_sampler=False)
+
+
+            try:
+                res_1:cma.evolution_strategy.CMAEvolutionStrategyResult = cma.fmin(ff,x0=x0.flatten().tolist(),sigma0=SIGMA_0,
+                                                                                options=opts,
+                                                                                restarts=MAX_RESTARTS_DEFAULT,eval_initial_x=True)
+                res_2:cma.evolution_strategy.CMAEvolutionStrategyResult = cma.fmin(ff2,x0=x0.flatten().tolist(), sigma0=SIGMA_0,
+                                                                                options=opts2,
+                                                                                eval_initial_x=True,
+                                                                                restarts=MAX_RESTARTS_DEFAULT)
+            
+            except ValueError as e:
+                raise ValueError(e.args,"There was the same error")
+            
+            
+
+        elif CMA_ES_HAND==2:
+
+
+            # Evaluate the functions
+            #ff(x0.ravel())
+            #ff2(x0.ravel())
+
+            @modify_array(x0)
+            def obj_func_1(x_, func:Starbox_problem=ff) -> float:
+                return func(x_)
+            
+            @modify_array(x0)
+            def obj_func_2(x_, func:Starbox_problem=ff2) -> float:
+                return func(x_)
+            
+            obj_func_1(x0)
+            obj_func_2(x0)
+
+
+            module_1 = c_maes.parameters.Modules()
+            module_2 = c_maes.parameters.Modules()
+
+            if MAX_RESTARTS_DEFAULT == 0:
+                module_1.restart_strategy = c_maes.options.RestartStrategy.NONE
+                module_2.restart_strategy = c_maes.options.RestartStrategy.NONE
+            else:
+                module_1.restart_strategy = c_maes.options.RestartStrategy.IPOP
+                module_2.restart_strategy = c_maes.options.RestartStrategy.IPOP
+
+            #module_1.restart_strategy = c_maes.options.RESTART
+            #module_2.restart_strategy = c_maes.options.RESTART
+
+            module_1.bound_correction = c_maes.options.CorrectionMethod.SATURATE
+            module_2.bound_correction = c_maes.options.CorrectionMethod.SATURATE
+
+            module_1.matrix_adaptation = c_maes.options.MatrixAdaptationType.COVARIANCE
+            module_2.matrix_adaptation = c_maes.options.MatrixAdaptationType.NONE
+
+            x01 = adjust_initial_input(x0=x0,dim=dim)
+
+            opts = c_maes.parameters.Settings(dim=dim, modules=module_1,x0=x01, 
+                                              sigma0 =SIGMA_0, budget=BUDGET, verbose=True,
+                                              mu0 = mu_0, lambda0 = lamda_0,
+                                              lb=np.array([-5.0]*dim), 
+                                              ub=np.array([5.0]*dim))
+            
+            opts2 = c_maes.parameters.Settings(dim=dim, modules=module_2,x0=x01, 
+                                               sigma0 =SIGMA_0, budget=BUDGET, verbose=True,
+                                               mu0 = mu_0, lambda0 = lamda_0,
+                                               lb=np.array([-5.0]*dim), 
+                                               ub=np.array([5.0]*dim))
+
+            parameters = c_maes.Parameters(opts)
+            parameters2 = c_maes.Parameters(opts2)
+
+            cma1 = c_maes.ModularCMAES(parameters)
+            cma2 = c_maes.ModularCMAES(parameters2)
+
+            cma1.run(obj_func_1)
+            #cma1.run(ff)
+            #while not cma1.break_conditions():
+            #    cma1.step(ff)
+            cma2.run(obj_func_2)
+
+        else:
+            raise NotImplementedError("No other libraries besides hansen's and de nobel's are used")
+
+
+
 
 
         # Evolution Strategy Object
-        es:cma.CMAEvolutionStrategy = cma.CMAEvolutionStrategy(x0=x0_1,sigma0=SIGMA_0,
-                                                            inopts=opts)
+        #es:cma.CMAEvolutionStrategy = cma.CMAEvolutionStrategy(x0=x0_1,sigma0=SIGMA_0,
+        #                                                    inopts=opts)
         
-        es2:cma.CMAEvolutionStrategy = cma.CMAEvolutionStrategy(x0=x0_1,sigma0=SIGMA_0,
-                                                            inopts=opts2)
+        #es2:cma.CMAEvolutionStrategy = cma.CMAEvolutionStrategy(x0=x0_1,sigma0=SIGMA_0,
+        #                                                    inopts=opts2)
 
-        logger.register(es,append=bestever.evalsall)
+        #logger.register(es,append=bestever.evalsall)
 
-        logger_2.register(es2,append=bestever_2.evalsall)
+        #logger_2.register(es2,append=bestever_2.evalsall)
     
-        # Run the optimization loop
-        # while not es.stop():
-        #     try:
-        #         solutions = np.array(es.ask()).reshape((-1,dim))
-        #     except ValueError as e:
-        #         print(e.args)
+        # # Run the optimization loop
+        # # while not es.stop():
+        # #     try:
+        # #         solutions = np.array(es.ask()).reshape((-1,dim))
+        # #     except ValueError as e:
+        # #         print(e.args)
 
-        #     es.tell(solutions, [ff(x) for x in solutions])
-        #     es.logger.add()  # write data to disc to be plotted
-        #     es.disp()
+        # #     es.tell(solutions, [ff(x) for x in solutions])
+        # #     es.logger.add()  # write data to disc to be plotted
+        # #     es.disp()
 
-        try:
-            es.optimize(ff,n_jobs=0)
-        except ValueError as e:
-            print(e.args)
-            #es.optimize(ff,n_jobs=0)
-            #es.optimize(ff)
-        except Exception as e:
-            print("Something happened: ", e.args)
-        else:
-            es.result_pretty()
-            cma.s.pprint(es.best.__dict__)
-            bestever.update(es.best)
+        # try:
+        #     es.optimize(ff,n_jobs=0)
+        # except ValueError as e:
+        #     raise ValueError(e.args)
+        #     #es.optimize(ff,n_jobs=0)
+        #     #es.optimize(ff)
+        # except Exception as e:
+        #     print("Something happened: ", e.args)
+        # else:
+        #     es.result_pretty()
+        #     cma.s.pprint(es.best.__dict__)
+        #     bestever.update(es.best)
 
         
 
-        # while not es2.stop():
+        # # while not es2.stop():
             
-        #     try:
-        #         solutions2 = np.array(es2.ask()).reshape((-1,dim))
-        #     except ValueError as e:
-        #         print(e.args)
+        # #     try:
+        # #         solutions2 = np.array(es2.ask()).reshape((-1,dim))
+        # #     except ValueError as e:
+        # #         print(e.args)
             
-        #     es2.tell(solutions2, [ff2(x) for x in solutions2])
-        #     es2.logger.add()  # write data to disc to be plotted
-        #     es2.disp()
-        try:
-            es2.optimize(ff2, n_jobs=0)
-        except ValueError as e:
-            print(e.args)
-            #es2.optimize(ff2, n_jobs=0)
-            #es2.optimize(ff2)
-        except Exception as e:
-            print("Something happened: ", e.args)
-        else:
-            es2.result_pretty()
-            #cma.s.pprint(es2.best.__dict__)
-            bestever_2.update(es2.best)
+        # #     es2.tell(solutions2, [ff2(x) for x in solutions2])
+        # #     es2.logger.add()  # write data to disc to be plotted
+        # #     es2.disp()
+        # try:
+        #     es2.optimize(ff2, n_jobs=0)
+        # except ValueError as e:
+        #     raise ValueError(e.args)
+        #     #es2.optimize(ff2, n_jobs=0)
+        #     #es2.optimize(ff2)
+        # except Exception as e:
+        #     print("Something happened: ", e.args)
+        # else:
+        #     es2.result_pretty()
+        #     #cma.s.pprint(es2.best.__dict__)
+        #     bestever_2.update(es2.best)
 
         #logger.plot()
-        logger.save_to(f"CMA_ES_aniso/optim_dim_{dim}_")
-        logger_2.save_to(f"CMA_ES_iso/optim_dim_{dim}_")
+        #logger.save_to(f"CMA_ES_aniso/optim_dim_{dim}_")
+        #logger_2.save_to(f"CMA_ES_iso/optim_dim_{dim}_")
 
 
         ff.reset()
